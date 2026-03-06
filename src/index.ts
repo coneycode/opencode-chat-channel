@@ -239,6 +239,7 @@ export const FeishuBotPlugin: Plugin = async ({ client }) => {
     // 先发"正在思考"
     await sendThinking(chatId);
 
+    let responseText: string | null = null;
     try {
       const sessionId = await getOrCreateSession(openId);
 
@@ -254,13 +255,7 @@ export const FeishuBotPlugin: Plugin = async ({ client }) => {
         },
       });
 
-      const responseText = extractResponseText(result.data?.parts ?? []);
-
-      if (responseText) {
-        await replyToFeishu(chatId, responseText);
-      } else {
-        await replyToFeishu(chatId, "（AI 没有返回文字回复）");
-      }
+      responseText = extractResponseText(result.data?.parts ?? []);
     } catch (err: any) {
       const errorMsg = err?.data?.message ?? err?.message ?? String(err);
       await client.app.log({
@@ -272,6 +267,14 @@ export const FeishuBotPlugin: Plugin = async ({ client }) => {
         },
       });
       await replyToFeishu(chatId, `⚠️ 出错了：${errorMsg}`);
+      return;
+    }
+
+    // try/catch 外发送回复，避免发送失败时再触发错误消息
+    if (responseText) {
+      await replyToFeishu(chatId, responseText);
+    } else {
+      await replyToFeishu(chatId, "（AI 没有返回文字回复）");
     }
   }
 
