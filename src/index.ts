@@ -1,274 +1,79 @@
 /**
- * opencode-feishu-bot — opencode 飞书机器人插件
+ * opencode-chat-channel — opencode 多渠道机器人插件
  *
- * 通过飞书长连接（WebSocket）接收消息，驱动 opencode AI 回复。
+ * 支持多个即时通讯渠道同时运行，每个渠道独立处理消息。
+ * 当前已实现：飞书（Feishu/Lark）
+ * 骨架已创建：企业微信（WeCom）
  *
- * 凭证存储方案（macOS Keychain）：
- *   FEISHU_APP_ID 存放在 ~/.config/opencode/.env（非敏感，可见）
- *   FEISHU_APP_SECRET 存放在系统钥匙串，service=opencode-feishu-bot，account=feishu-bot
- *   写入命令：
- *     security add-generic-password -a feishu-bot -s opencode-feishu-bot -w <secret> -U
+ * 凭证加载：
+ *   FEISHU_APP_ID 等非敏感凭证存放在 ~/.config/opencode/.env
+ *   敏感凭证存放在 macOS Keychain（各渠道独立 service/account）
  *
- * 每个飞书用户（open_id）独享一个 opencode session，对话历史保留。
+ * 每个渠道用户独享一个 opencode session，对话历史保留 2 小时。
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
-import * as Lark from "@larksuiteoapi/node-sdk";
-import { execFileSync, execSync } from "child_process";
-import { readFileSync } from "fs";
 import { join } from "path";
+import { loadDotEnv, SessionManager, extractResponseText } from "./session-manager.js";
+import { feishuChannelFactory } from "./channels/feishu/index.js";
+import { wecomChannelFactory } from "./channels/wecom/index.js";
+import type { ChannelFactory, ChatChannel, IncomingMessage, PluginClient } from "./types.js";
 
-// ─── 读取 .env 文件 ───────────────────────────────────────────────────────────
+// ─── opencode AI 配置 ─────────────────────────────────────────────────────────
 
-/**
- * 从指定路径读取 .env 文件，将其中的 KEY=VALUE 注入到 process.env。
- * opencode 启动时不会自动加载 ~/.config/opencode/.env，需要插件自行处理。
- */
-function loadDotEnv(envPath: string): void {
-  try {
-    const content = readFileSync(envPath, "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx < 1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim();
-      // 不覆盖已有的环境变量（优先使用外部注入的）
-      if (!process.env[key]) {
-        process.env[key] = value;
-      }
-    }
-  } catch {
-    // .env 文件不存在或不可读，忽略
-  }
-}
-
-// ─── 类型 ─────────────────────────────────────────────────────────────────────
-
-interface SessionMeta {
-  sessionId: string;
-  lastActivity: number;
-}
-
-// ─── 常量 ─────────────────────────────────────────────────────────────────────
-
-/** session 闲置超过此时间（ms）后自动清理，下次对话从新 session 开始 */
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 小时
 /** opencode API 地址（本地默认）*/
 const OPENCODE_BASE_URL = process.env["OPENCODE_BASE_URL"] ?? "http://localhost:4321";
 
-// ─── 插件主体 ─────────────────────────────────────────────────────────────────
+// ─── 注册渠道列表 ─────────────────────────────────────────────────────────────
 
-export const FeishuBotPlugin: Plugin = async ({ client }) => {
-  // 先加载 .env 文件（opencode 不会自动注入，需插件自行读取）
-  const configDir = join(
-    process.env["HOME"] ?? "/Users/" + (process.env["USER"] ?? "unknown"),
-    ".config", "opencode"
-  );
-  loadDotEnv(join(configDir, ".env"));
+/**
+ * 在此添加新渠道工厂函数即可接入新渠道。
+ * 工厂函数返回 null 时，插件会静默跳过该渠道。
+ */
+const CHANNEL_FACTORIES: ChannelFactory[] = [
+  feishuChannelFactory,
+  wecomChannelFactory,
+  // 新渠道示例：
+  // dingtalkChannelFactory,
+  // slackChannelFactory,
+];
 
-  const appId = process.env["FEISHU_APP_ID"];
+// ─── 消息处理核心 ─────────────────────────────────────────────────────────────
 
-  // 从 macOS Keychain 读取 App Secret（不落盘明文）
-  let appSecret: string | undefined;
-  try {
-    const stdout = execFileSync("security", [
-      "find-generic-password",
-      "-a", "feishu-bot",
-      "-s", "opencode-feishu-bot",
-      "-w",
-    ], { encoding: "utf8" });
-    appSecret = stdout.trim() || undefined;
-  } catch {
-    appSecret = undefined;
-  }
-
-  if (!appId || !appSecret) {
-    await client.app.log({
-      body: {
-        service: "feishu-bot",
-        level: "warn",
-        message: !appId
-          ? "FEISHU_APP_ID 未设置（请在 .env 中添加），飞书机器人插件已跳过"
-          : "FEISHU_APP_SECRET 未找到（请写入 Keychain），飞书机器人插件已跳过",
-      },
-    });
-    return {};
-  }
-
-  // 飞书 API 客户端（用于发送消息）
-  const larkClient = new Lark.Client({
-    appId,
-    appSecret,
-    appType: Lark.AppType.SelfBuild,
-    domain: Lark.Domain.Feishu,
-  });
-
-  // 用户 session 映射：feishu open_id → opencode session
-  const userSessions = new Map<string, SessionMeta>();
-
-  // 已处理过的消息 ID（去重，防止飞书重复投递）
-  const processedMessages = new Set<string>();
-  // 避免 Set 无限增长，超过 500 条时清空旧的
-  const MAX_PROCESSED = 500;
-
-  // ── 获取或创建 opencode session ──────────────────────────────────────────
-
-  async function getOrCreateSession(openId: string): Promise<string> {
-    const existing = userSessions.get(openId);
-    const now = Date.now();
-
-    if (existing && now - existing.lastActivity < SESSION_TTL_MS) {
-      existing.lastActivity = now;
-      return existing.sessionId;
-    }
-
-    // 创建新 session
-    const res = await client.session.create({
-      body: { title: `飞书对话 · ${openId}` },
-    });
-
-    const sessionId = res.data!.id;
-    userSessions.set(openId, { sessionId, lastActivity: now });
+/**
+ * 为指定渠道创建消息处理函数。
+ * 每个渠道拥有独立的 SessionManager（用户 session 互不干扰）。
+ */
+function createMessageHandler(
+  channel: ChatChannel,
+  sessionManager: SessionManager,
+  client: PluginClient
+) {
+  return async (msg: IncomingMessage): Promise<void> => {
+    const { userId, replyTarget, text } = msg;
 
     await client.app.log({
       body: {
-        service: "feishu-bot",
+        service: "chat-channel",
         level: "info",
-        message: `创建新 session: ${sessionId}`,
-        extra: { openId },
+        message: `[${channel.name}] 收到消息: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+        extra: { userId, replyTarget },
       },
     });
 
-    return sessionId;
-  }
-
-  // ── 清理过期 session ──────────────────────────────────────────────────────
-
-  function cleanupExpiredSessions() {
-    const now = Date.now();
-    for (const [openId, meta] of userSessions.entries()) {
-      if (now - meta.lastActivity > SESSION_TTL_MS) {
-        userSessions.delete(openId);
-      }
+    // 先发"正在思考"（若渠道支持）
+    if ("sendThinking" in channel && typeof (channel as any).sendThinking === "function") {
+      await (channel as any).sendThinking(replyTarget);
     }
-  }
-  setInterval(cleanupExpiredSessions, 30 * 60 * 1000);
-
-  // ── 发送飞书文本消息 ──────────────────────────────────────────────────────
-
-  async function replyToFeishu(chatId: string, text: string): Promise<void> {
-    // 飞书消息长度限制 4096 字符，超长时分段发送
-    const MAX_LEN = 4000;
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += MAX_LEN) {
-      chunks.push(text.slice(i, i + MAX_LEN));
-    }
-
-    for (const chunk of chunks) {
-      await larkClient.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify({ text: chunk }),
-          msg_type: "text",
-        },
-      });
-    }
-  }
-
-  // ── 发送"正在思考"占位消息 ──────────────────────────────────────────────
-
-  async function sendThinking(chatId: string): Promise<void> {
-    await larkClient.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: {
-        receive_id: chatId,
-        content: JSON.stringify({ text: "⏳ 正在思考..." }),
-        msg_type: "text",
-      },
-    });
-  }
-
-  // ── 提取 AI 响应文本 ──────────────────────────────────────────────────────
-
-  function extractResponseText(parts: unknown[]): string {
-    if (!Array.isArray(parts)) return "";
-    return parts
-      .filter((p: any) => p?.type === "text")
-      .map((p: any) => p?.text ?? "")
-      .join("")
-      .trim();
-  }
-
-  // ── 处理飞书消息 ──────────────────────────────────────────────────────────
-
-  async function handleMessage(data: any): Promise<void> {
-    const { message, sender } = data;
-
-    // 只处理文本消息
-    if (message.message_type !== "text") {
-      await larkClient.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: {
-          receive_id: message.chat_id,
-          content: JSON.stringify({ text: "暂时只支持文本消息 😊" }),
-          msg_type: "text",
-        },
-      });
-      return;
-    }
-
-    // 去重：飞书 WebSocket 可能重复投递同一条消息
-    const msgId: string = message.message_id;
-    if (processedMessages.has(msgId)) {
-      await client.app.log({
-        body: {
-          service: "feishu-bot",
-          level: "info",
-          message: `重复消息已忽略: ${msgId}`,
-        },
-      });
-      return;
-    }
-    if (processedMessages.size >= MAX_PROCESSED) processedMessages.clear();
-    processedMessages.add(msgId);
-
-
-    // 解析消息内容
-    let userText: string;
-    try {
-      userText = (JSON.parse(message.content) as { text: string }).text?.trim();
-    } catch {
-      return;
-    }
-    if (!userText) return;
-
-    const openId = sender.sender_id?.open_id ?? message.chat_id;
-    const chatId = message.chat_id;
-
-    await client.app.log({
-      body: {
-        service: "feishu-bot",
-        level: "info",
-        message: `收到消息: "${userText.slice(0, 80)}${userText.length > 80 ? "..." : ""}"`,
-        extra: { openId, chatId },
-      },
-    });
-
-    // 先发"正在思考"
-    await sendThinking(chatId);
 
     let responseText: string | null = null;
     try {
-      const sessionId = await getOrCreateSession(openId);
+      const sessionId = await sessionManager.getOrCreate(userId);
 
-      // 发送给 opencode，等待 AI 完整回复
       const result = await client.session.prompt({
         path: { id: sessionId },
         body: {
-          parts: [{ type: "text", text: userText }],
+          parts: [{ type: "text", text }],
           model: {
             providerID: "Mify-Anthropic",
             modelID: "ppio/pa/claude-sonnet-4-6",
@@ -277,59 +82,92 @@ export const FeishuBotPlugin: Plugin = async ({ client }) => {
       });
 
       responseText = extractResponseText(result.data?.parts ?? []);
-    } catch (err: any) {
-      const errorMsg = err?.data?.message ?? err?.message ?? String(err);
+    } catch (err: unknown) {
+      const errorMsg =
+        (err as any)?.data?.message ?? (err as any)?.message ?? String(err);
+
       await client.app.log({
         body: {
-          service: "feishu-bot",
+          service: "chat-channel",
           level: "error",
-          message: `处理消息失败: ${errorMsg}`,
-          extra: { openId },
+          message: `[${channel.name}] 处理消息失败: ${errorMsg}`,
+          extra: { userId },
         },
       });
-      await replyToFeishu(chatId, `⚠️ 出错了：${errorMsg}`);
+      await channel.send(replyTarget, `⚠️ 出错了：${errorMsg}`);
       return;
     }
 
     // try/catch 外发送回复，避免发送失败时再触发错误消息
-    if (responseText) {
-      await replyToFeishu(chatId, responseText);
-    } else {
-      await replyToFeishu(chatId, "（AI 没有返回文字回复）");
-    }
+    await channel.send(
+      replyTarget,
+      responseText || "（AI 没有返回文字回复）"
+    );
+  };
+}
+
+// ─── 插件主体 ─────────────────────────────────────────────────────────────────
+
+export const ChatChannelPlugin: Plugin = async ({ client }) => {
+  // 加载 .env 文件（opencode 不会自动注入）
+  const configDir = join(
+    process.env["HOME"] ?? `/Users/${process.env["USER"] ?? "unknown"}`,
+    ".config",
+    "opencode"
+  );
+  loadDotEnv(join(configDir, ".env"));
+
+  // 初始化所有渠道
+  const channels: ChatChannel[] = [];
+  for (const factory of CHANNEL_FACTORIES) {
+    const channel = await factory(client);
+    if (channel) channels.push(channel);
   }
 
-  // ── 启动飞书 WSClient 长连接 ──────────────────────────────────────────────
+  if (channels.length === 0) {
+    await client.app.log({
+      body: {
+        service: "chat-channel",
+        level: "warn",
+        message: "所有渠道均未就绪（凭证缺失或未配置），插件空启动。",
+      },
+    });
+    return {};
+  }
 
-  const wsClient = new Lark.WSClient({
-    appId,
-    appSecret,
-    loggerLevel: Lark.LoggerLevel.warn,
-  });
+  // 为每个渠道启动独立的消息监听和 session 管理
+  const cleanupTimers: ReturnType<typeof setInterval>[] = [];
 
-  wsClient.start({
-    eventDispatcher: new Lark.EventDispatcher({}).register({
-      "im.message.receive_v1": handleMessage,
-    }),
-  });
+  for (const channel of channels) {
+    const sessionManager = new SessionManager(
+      client,
+      channel.name,
+      (userId) => `${channel.name} 对话 · ${userId}`
+    );
+
+    const timer = sessionManager.startAutoCleanup();
+    cleanupTimers.push(timer);
+
+    const handleMessage = createMessageHandler(channel, sessionManager, client);
+    await channel.start(handleMessage);
+  }
 
   await client.app.log({
     body: {
-      service: "feishu-bot",
+      service: "chat-channel",
       level: "info",
-      message: `飞书机器人已启动（长连接模式），appId=${appId.slice(0, 8)}***`,
+      message: `chat-channel 已启动，活跃渠道: ${channels.map((c) => c.name).join(", ")}`,
     },
   });
 
   // ── 插件钩子 ─────────────────────────────────────────────────────────────
 
   return {
-    // 监听 opencode session 状态，用于调试
     event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
       if (event.type === "session.error") {
         await client.app.log({
           body: {
-            service: "feishu-bot",
+            service: "chat-channel",
             level: "warn",
             message: "opencode session 出现错误",
             extra: event.properties as Record<string, unknown>,
@@ -340,3 +178,8 @@ export const FeishuBotPlugin: Plugin = async ({ client }) => {
   };
 };
 
+export default ChatChannelPlugin;
+
+// 导出类型和工具，供自定义渠道实现使用
+export type { ChatChannel, ChannelFactory, IncomingMessage, PluginClient } from "./types.js";
+export { SessionManager, extractResponseText, loadDotEnv } from "./session-manager.js";
