@@ -1,0 +1,26 @@
+{
+  "name": "opencode-feishu-bot",
+  "version": "1.0.0",
+  "description": "opencode plugin — Feishu (Lark) bot via WebSocket long connection",
+  "main": "src/index.ts",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "feishu",
+    "lark",
+    "bot",
+    "websocket"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.37.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
