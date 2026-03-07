@@ -1,15 +1,17 @@
 /**
  * opencode-chat-channel — opencode 多渠道机器人插件
  *
- * 支持多个即时通讯渠道同时运行，每个渠道独立处理消息。
- * 当前已实现：飞书（Feishu/Lark）
- * 骨架已创建：企业微信（WeCom）
+ * 通过 .env 文件中的 CHAT_CHANNELS 配置项选择启用哪些渠道：
  *
- * 凭证加载：
- *   FEISHU_APP_ID 等非敏感凭证存放在 ~/.config/opencode/.env
- *   敏感凭证存放在 macOS Keychain（各渠道独立 service/account）
+ *   CHAT_CHANNELS=feishu          # 只启用飞书
+ *   CHAT_CHANNELS=feishu,wecom    # 同时启用飞书和企业微信
+ *   CHAT_CHANNELS=                # 留空：自动探测（凭证存在即启用）
+ *   # 不配置此项：同留空，自动探测
  *
- * 每个渠道用户独享一个 opencode session，对话历史保留 2 小时。
+ * 其他配置项：
+ *   OPENCODE_BASE_URL   opencode API 地址（默认 http://localhost:4321）
+ *
+ * 各渠道的凭证配置详见 README。
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
@@ -17,26 +19,59 @@ import { join } from "path";
 import { loadDotEnv, SessionManager, extractResponseText } from "./session-manager.js";
 import { feishuChannelFactory } from "./channels/feishu/index.js";
 import { wecomChannelFactory } from "./channels/wecom/index.js";
-import type { ChannelFactory, ChatChannel, IncomingMessage, PluginClient } from "./types.js";
+import type { ChannelFactory, ChannelName, ChatChannel, IncomingMessage, PluginClient } from "./types.js";
 
-// ─── opencode AI 配置 ─────────────────────────────────────────────────────────
-
-/** opencode API 地址（本地默认）*/
-const OPENCODE_BASE_URL = process.env["OPENCODE_BASE_URL"] ?? "http://localhost:4321";
-
-// ─── 注册渠道列表 ─────────────────────────────────────────────────────────────
+// ─── 渠道注册表 ───────────────────────────────────────────────────────────────
 
 /**
- * 在此添加新渠道工厂函数即可接入新渠道。
- * 工厂函数返回 null 时，插件会静默跳过该渠道。
+ * 所有可用渠道的注册表。
+ * 新增渠道时：
+ *   1. 在 src/channels/<name>/index.ts 实现 ChatChannel 接口
+ *   2. 在 src/types.ts 的 ChannelName 联合类型中添加名称
+ *   3. 在此处注册工厂函数
  */
-const CHANNEL_FACTORIES: ChannelFactory[] = [
-  feishuChannelFactory,
-  wecomChannelFactory,
-  // 新渠道示例：
-  // dingtalkChannelFactory,
-  // slackChannelFactory,
-];
+const CHANNEL_REGISTRY: Record<ChannelName, ChannelFactory> = {
+  feishu: feishuChannelFactory,
+  wecom: wecomChannelFactory,
+};
+
+// ─── 渠道选择 ─────────────────────────────────────────────────────────────────
+
+/**
+ * 根据 CHAT_CHANNELS 环境变量解析用户期望启用的渠道。
+ *
+ * 规则：
+ *   - 未设置 / 空值 → 返回 null（自动模式：尝试所有渠道，凭证存在即启用）
+ *   - "feishu"       → ["feishu"]
+ *   - "feishu,wecom" → ["feishu", "wecom"]
+ *   - 未知渠道名会记录警告并跳过
+ */
+function resolveEnabledChannels(client: PluginClient): ChannelName[] | null {
+  const raw = process.env["CHAT_CHANNELS"]?.trim();
+
+  // 未配置或空值 → 自动模式
+  if (!raw) return null;
+
+  const requested = raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const known = Object.keys(CHANNEL_REGISTRY) as ChannelName[];
+  const enabled: ChannelName[] = [];
+
+  for (const name of requested) {
+    if (known.includes(name as ChannelName)) {
+      enabled.push(name as ChannelName);
+    } else {
+      void client.app.log({
+        body: {
+          service: "chat-channel",
+          level: "warn",
+          message: `[config] 未知渠道名 "${name}"，已忽略。可用渠道：${known.join(", ")}`,
+        },
+      });
+    }
+  }
+
+  return enabled;
+}
 
 // ─── 消息处理核心 ─────────────────────────────────────────────────────────────
 
@@ -98,7 +133,6 @@ function createMessageHandler(
       return;
     }
 
-    // try/catch 外发送回复，避免发送失败时再触发错误消息
     await channel.send(
       replyTarget,
       responseText || "（AI 没有返回文字回复）"
@@ -117,19 +151,40 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
   );
   loadDotEnv(join(configDir, ".env"));
 
-  // 初始化所有渠道
+  // 确定候选渠道列表
+  const enabledNames = resolveEnabledChannels(client);
+  const factories: Array<[ChannelName, ChannelFactory]> = enabledNames
+    ? // 显式模式：只启用用户指定的渠道
+      enabledNames.map((name) => [name, CHANNEL_REGISTRY[name]])
+    : // 自动模式：尝试所有已注册渠道
+      (Object.entries(CHANNEL_REGISTRY) as Array<[ChannelName, ChannelFactory]>);
+
+  if (enabledNames) {
+    await client.app.log({
+      body: {
+        service: "chat-channel",
+        level: "info",
+        message: `[config] CHAT_CHANNELS="${process.env["CHAT_CHANNELS"]}"，将启用: ${enabledNames.join(", ") || "（无）"}`,
+      },
+    });
+  }
+
+  // 初始化渠道实例
   const channels: ChatChannel[] = [];
-  for (const factory of CHANNEL_FACTORIES) {
+  for (const [, factory] of factories) {
     const channel = await factory(client);
     if (channel) channels.push(channel);
   }
 
   if (channels.length === 0) {
+    const hint = enabledNames
+      ? `检查 CHAT_CHANNELS="${process.env["CHAT_CHANNELS"]}" 指定的渠道是否已配置凭证`
+      : "请在 .env 中配置至少一个渠道的凭证，或设置 CHAT_CHANNELS=<渠道名> 明确指定";
     await client.app.log({
       body: {
         service: "chat-channel",
         level: "warn",
-        message: "所有渠道均未就绪（凭证缺失或未配置），插件空启动。",
+        message: `所有渠道均未就绪，插件空启动。${hint}`,
       },
     });
     return {};
@@ -181,5 +236,5 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
 export default ChatChannelPlugin;
 
 // 导出类型和工具，供自定义渠道实现使用
-export type { ChatChannel, ChannelFactory, IncomingMessage, PluginClient } from "./types.js";
+export type { ChatChannel, ChannelFactory, ChannelName, IncomingMessage, PluginClient } from "./types.js";
 export { SessionManager, extractResponseText, loadDotEnv } from "./session-manager.js";

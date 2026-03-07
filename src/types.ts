@@ -65,3 +65,11 @@ export interface ChatChannel {
 export type ChannelFactory = (
   client: PluginClient
 ) => Promise<ChatChannel | null>;
+
+// ─── 已知渠道名称 ──────────────────────────────────────────────────────────────────
+
+/**
+ * 已注册的渠道名称。
+ * 新增渠道时在此处添加对应字面量，便于编译期检查。
+ */
+export type ChannelName = "feishu" | "wecom";
