@@ -105,15 +105,11 @@ function createMessageHandler(
     try {
       const sessionId = await sessionManager.getOrCreate(userId);
 
-      const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
       const result = await client.session.prompt({
         path: { id: sessionId },
         body: {
           parts: [{ type: "text", text }],
-          // 不锁定 model，让 session 使用用户在 opencode 配置的默认模型
-          // agent 不指定，让 opencode 使用默认 agent（含全部工具：bash/文件/搜索等），保持与终端对话一致
-          // 注入当前时间和基础环境信息
-          system: `当前时间：${now}（北京时间 CST）。来自飞书渠道的消息。`,
+          // model/agent 均不指定，使用 opencode 默认配置，与终端对话保持一致
         },
       });
 
