@@ -90,7 +90,9 @@ class FeishuChannel implements ChatChannel {
       eventDispatcher: new Lark.EventDispatcher({}).register({
         "im.message.receive_v1": async (data: any) => {
           const parsed = this.parseEvent(data);
-          if (parsed) await onMessage(parsed);
+          // 立即返回使飞书SDK能发出ACK，避免飞书超时重投递
+          // onMessage 异步执行，已通过 parseEvent 内的去重保证不重复处理
+          if (parsed) void onMessage(parsed);
         },
       }),
     });
