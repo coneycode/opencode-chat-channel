@@ -1,6 +1,6 @@
 {
   "name": "opencode-chat-channel",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "opencode plugin — multi-channel bot (Feishu/Lark, WeCom) with extensible ChatChannel interface",
   "type": "module",
   "main": "./dist/index.js",

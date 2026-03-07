@@ -96,11 +96,6 @@ function createMessageHandler(
       },
     });
 
-    // 先发"正在思考"（若渠道支持）
-    if ("sendThinking" in channel && typeof (channel as any).sendThinking === "function") {
-      await (channel as any).sendThinking(replyTarget);
-    }
-
     let responseText: string | null = null;
     try {
       const sessionId = await sessionManager.getOrCreate(userId);
