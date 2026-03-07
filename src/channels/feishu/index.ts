@@ -127,17 +127,6 @@ class FeishuChannel implements ChatChannel {
 
   // ── 内部工具 ─────────────────────────────────────────────────────────────
 
-  /** 发送"正在思考"占位消息 */
-  async sendThinking(chatId: string): Promise<void> {
-    await this.larkClient.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: {
-        receive_id: chatId,
-        content: JSON.stringify({ text: "⏳ 正在思考..." }),
-        msg_type: "text",
-      },
-    });
-  }
 
   /** 解析飞书事件，返回标准化 IncomingMessage；无效/重复消息返回 null */
   private parseEvent(data: any): IncomingMessage | null {

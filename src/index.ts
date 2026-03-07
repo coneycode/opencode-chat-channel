@@ -237,4 +237,4 @@ export default ChatChannelPlugin;
 
 // 导出类型和工具，供自定义渠道实现使用
 export type { ChatChannel, ChannelFactory, ChannelName, IncomingMessage, PluginClient } from "./types.js";
-export { SessionManager, extractResponseText, loadDotEnv } from "./session-manager.js";
+export { extractResponseText, loadDotEnv } from "./session-manager.js";
