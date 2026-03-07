@@ -47,7 +47,26 @@ Edit `~/.config/opencode/opencode.json` and add the plugin:
 
 opencode will pull and install the package automatically on next startup.
 
-#### Step 2: Configure the channel(s) you want to use
+#### Step 2: Select channels to enable
+
+Add `CHAT_CHANNELS` to `~/.config/opencode/.env` to control which channels are active:
+
+```bash
+# ~/.config/opencode/.env
+
+# Enable Feishu only (recommended to start)
+CHAT_CHANNELS=feishu
+
+# Enable multiple channels at once
+# CHAT_CHANNELS=feishu,wecom
+
+# Leave unset or empty = auto mode: any channel with valid credentials starts automatically
+# CHAT_CHANNELS=
+```
+
+Then configure credentials for each enabled channel (see sections below).
+
+#### Step 3: Configure channel credentials
 
 See the [Feishu Configuration](#feishu-configuration) section below.
 
@@ -205,7 +224,26 @@ opencode AI (Sisyphus)
 
 下次启动 opencode 时会自动拉取并安装。
 
-#### 第二步：配置需要使用的渠道
+#### 第二步：选择要启用的渠道
+
+在 `~/.config/opencode/.env` 中配置 `CHAT_CHANNELS`，指定要开启哪些渠道：
+
+```bash
+# ~/.config/opencode/.env
+
+# 只开启飞书（初始推荐）
+CHAT_CHANNELS=feishu
+
+# 同时开启多个渠道
+# CHAT_CHANNELS=feishu,wecom
+
+# 留空或不配置 = 自动模式：凭证存在的渠道自动启用
+# CHAT_CHANNELS=
+```
+
+然后配置对应渠道的凭证（见下方各渠道配置说明）。
+
+#### 第三步：配置渠道凭证
 
 参见下方各渠道的配置说明。
 
