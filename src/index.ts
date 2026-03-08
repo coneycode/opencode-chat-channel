@@ -16,7 +16,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin";
 import { join } from "path";
-import { loadDotEnv, SessionManager, extractResponseText } from "./session-manager.js";
+import { loadDotEnv, SessionManager, extractResponseText, fileLog } from "./session-manager.js";
 import { feishuChannelFactory } from "./channels/feishu/index.js";
 import { wecomChannelFactory } from "./channels/wecom/index.js";
 import type { ChannelFactory, ChannelName, ChatChannel, IncomingMessage, PluginClient } from "./types.js";
@@ -103,30 +103,40 @@ const REASONING_PREVIEW_LEN = 200;
 const PATCH_THROTTLE_MS = 3000;
 
 /**
+ * 待处理的 session 完成等待 Map。
+ * key = sessionId，value = { resolve, reject } 用于在 event 钩子触发时唤醒等待方。
+ * 由 ChatChannelPlugin 创建后注入到 createMessageHandler 中使用。
+ */
+type PendingEntry = { resolve: () => void; reject: (err: Error) => void };
+type PendingMap = Map<string, PendingEntry>;
+
+
+/**
  * 为指定渠道创建消息处理函数。
  * 每个渠道拥有独立的 SessionManager（用户 session 互不干扰）。
  *
  * 流程：
  *   1. 发送"正在思考"占位卡片（支持 patch 的渠道）
  *   2. promptAsync 发起 AI 请求（立即返回）
- *   3. 订阅 SSE 事件流，实时 patch 更新占位卡片
- *      - reasoning part → 更新为思考摘要
- *      - tool part (running) → 更新为"正在使用工具: xxx"
- *   4. session idle 时发送最终文字回复
+ *   3. 等待 event 钩子回调（session.idle / session.error），由 pendingMap 协调
+ *   4. session 完成后读取最终回复并发送
  */
 function createMessageHandler(
   channel: ChatChannel,
   sessionManager: SessionManager,
-  client: PluginClient
+  client: PluginClient,
+  pendingMap: PendingMap
 ) {
   return async (msg: IncomingMessage): Promise<void> => {
     const { userId, replyTarget, text } = msg;
 
+    const incomingMsg = `[${channel.name}] 收到消息: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`;
+    fileLog("info", incomingMsg);
     await client.app.log({
       body: {
         service: "chat-channel",
         level: "info",
-        message: `[${channel.name}] 收到消息: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+        message: incomingMsg,
         extra: { userId, replyTarget },
       },
     });
@@ -142,27 +152,16 @@ function createMessageHandler(
       sessionId = await sessionManager.getOrCreate(userId);
     } catch (err: unknown) {
       const errorMsg = (err as any)?.message ?? String(err);
+      const errMsg1 = `[${channel.name}] 获取 session 失败: ${errorMsg}`;
+      fileLog("error", errMsg1);
       await client.app.log({
-        body: { service: "chat-channel", level: "error", message: `[${channel.name}] 获取 session 失败: ${errorMsg}`, extra: { userId } },
+        body: { service: "chat-channel", level: "error", message: errMsg1, extra: { userId } },
       });
       await channel.send(replyTarget, `⚠️ 出错了：${errorMsg}`);
       return;
     }
 
-    // ── 步骤 2: 先建立 SSE 订阅，再发 prompt（避免 race condition） ──────────
-    // 如果先 promptAsync 再订阅 SSE，AI 可能在 SSE 连接建立之前就完成了，
-    // 导致 session.idle 事件被错过，消息永远不会发出去。
-    let eventStream: Awaited<ReturnType<typeof client.event.subscribe>> | null = null;
-    try {
-      eventStream = await client.event.subscribe();
-    } catch (err: unknown) {
-      // SSE 订阅失败，降级：仍然发 prompt，最后用轮询获取结果
-      await client.app.log({
-        body: { service: "chat-channel", level: "warn", message: `[${channel.name}] SSE 订阅失败，降级为轮询: ${String(err)}` },
-      });
-    }
-
-    // ── 步骤 3: promptAsync 发起请求（AI 在后台运行） ────────────────────────
+    // ── 步骤 2: promptAsync 发起请求（AI 在后台运行） ────────────────────────
     try {
       await client.session.promptAsync({
         path: { id: sessionId },
@@ -184,108 +183,56 @@ function createMessageHandler(
       return;
     }
 
-    // ── 步骤 4: 消费 SSE 事件流，等待 session 完成，发送最终回复 ─────────────
-    await consumeSessionEvents(client, channel, sessionId, replyTarget, thinkingMsgId, eventStream);
+    // ── 步骤 3: 等待 session 完成（由 event 钩子触发），发送最终回复 ───────────
+    await waitForSessionAndReply(client, channel, sessionId, replyTarget, thinkingMsgId, pendingMap);
   };
 }
 
 /**
- * 订阅 opencode 全局 SSE 事件流，等待指定 session 完成。
- * 期间实时 patch 更新思考占位卡片，完成后发送最终回复。
+ * 向 pendingMap 注册一个 Promise，等待 event 钩子的 session.idle / session.error 触发。
+ * 触发后读取最终回复并发送到渠道。
  *
- * 注意：eventStream 必须在 promptAsync 之前建立（由调用方负责），
- * 以避免 race condition（AI 完成时 SSE 尚未建立，session.idle 被错过）。
+ * 利用 opencode 插件的 event 钩子（进程内函数回调），完全绕开 SSE 的
+ * AsyncLocalStorage context 隔离问题。
  */
-async function consumeSessionEvents(
+async function waitForSessionAndReply(
   client: PluginClient,
   channel: ChatChannel,
   sessionId: string,
   replyTarget: string,
   thinkingMsgId: string | null,
-  /** 已在 promptAsync 之前建立的 SSE 订阅；为 null 时降级为轮询 */
-  eventStream: Awaited<ReturnType<typeof client.event.subscribe>> | null
+  pendingMap: PendingMap
 ): Promise<void> {
-  // 节流控制：上次 patch 的时间戳
-  let lastPatchAt = 0;
-  // 累积的 reasoning 文本（用于摘要）
-  let reasoningAccum = "";
-
-  const log = (level: "info" | "warn" | "error", message: string) =>
+  const log = (level: "info" | "warn" | "error", message: string) => {
+    fileLog(level, message);
     void client.app.log({ body: { service: "chat-channel", level, message } });
+  };
 
-  /**
-   * 节流 patch：距上次 patch 超过 PATCH_THROTTLE_MS 才实际发送。
-   * 强制更新时忽略节流（用于最终状态）。
-   */
-  async function throttledPatch(text: string, force = false): Promise<void> {
-    if (!thinkingMsgId || !channel.updateThinkingCard) return;
-    const now = Date.now();
-    if (!force && now - lastPatchAt < PATCH_THROTTLE_MS) return;
-    lastPatchAt = now;
-    await channel.updateThinkingCard(thinkingMsgId, text);
-  }
+  // 注册 Promise，等待 event 钩子 resolve
+  const SESSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟兜底超时
+  await new Promise<void>((resolve, reject) => {
+    // 兜底超时，防止 event 钩子因某种原因永远不来
+    const timeoutId = setTimeout(() => {
+      pendingMap.delete(sessionId);
+      log("warn", `[${channel.name}] session 等待超时（5分钟），强制继续读取回复`);
+      resolve(); // 超时也继续读消息，不 reject
+    }, SESSION_TIMEOUT_MS);
 
-  if (eventStream) {
-    // 先检查 session 是否已经 idle（SSE 是 lazy generator，HTTP 连接
-    // 在 for-await 时才建立，可能错过已经发布的 session.idle 事件）
-    let alreadyDone = false;
-    try {
-      const statusRes = await client.session.status();
-      const allStatuses = statusRes.data ?? {};
-      const sessionStatus = (allStatuses as Record<string, { type: string }>)[sessionId];
-      if (!sessionStatus || sessionStatus.type === "idle") {
-        alreadyDone = true;
-        log("info", `[${channel.name}] session 已完成，跳过 SSE 等待`);
-      }
-    } catch {
-      // 查询失败时继续走 SSE 路径
-    }
-
-    if (!alreadyDone) {
-      // SSE 等待，加超时保障（最多 3 分钟）
-      const SSE_TIMEOUT_MS = 3 * 60 * 1000;
-      const abortController = new AbortController();
-      const timeoutId = setTimeout(() => {
-        log("warn", `[${channel.name}] SSE 等待超时，强制结束`);
-        abortController.abort();
-      }, SSE_TIMEOUT_MS);
-
-      try {
-        for await (const event of eventStream.stream) {
-          if (abortController.signal.aborted) break;
-          if (!isSessionEvent(event, sessionId)) continue;
-
-          if (event.type === "message.part.updated") {
-            const part = event.properties?.part;
-            if (!part) continue;
-
-            if (part.type === "reasoning" && part.text) {
-              reasoningAccum = part.text;
-              const preview = stripMarkdownTables(reasoningAccum.slice(0, REASONING_PREVIEW_LEN));
-              const suffix = reasoningAccum.length > REASONING_PREVIEW_LEN ? "..." : "";
-              await throttledPatch(`💭 **正在思考...**\n\n${preview}${suffix}`);
-            } else if (part.type === "tool" && part.state?.status === "running") {
-              const toolLabel = (part.tool ?? "") || "工具";
-              await throttledPatch(`🔧 **正在使用工具：${toolLabel}**`);
-            }
-          }
-
-          if (event.type === "session.idle" || event.type === "session.error") {
-            break;
-          }
-        }
-      } catch (err) {
-        if (!abortController.signal.aborted) {
-          log("warn", `[${channel.name}] SSE 事件流中断: ${String(err)}`);
-        }
-      } finally {
+    pendingMap.set(sessionId, {
+      resolve: () => {
         clearTimeout(timeoutId);
-      }
-    }
-  } else {
-    // SSE 不可用时，轮询等待 session 完成
-    await pollForSessionCompletion(client, channel.name, sessionId);
-  }
+        pendingMap.delete(sessionId);
+        resolve();
+      },
+      reject: (err: Error) => {
+        clearTimeout(timeoutId);
+        pendingMap.delete(sessionId);
+        reject(err);
+      },
+    });
+  }).catch((err: Error) => {
+    log("error", `[${channel.name}] session 出错: ${err.message}`);
+  });
 
   // 获取最终回复并发送
   let responseText: string | null = null;
@@ -293,6 +240,7 @@ async function consumeSessionEvents(
     const messagesRes = await client.session.messages({ path: { id: sessionId } });
     const messages = messagesRes.data ?? [];
     const lastAssistant = [...messages].reverse().find((m: any) => m.info?.role === "assistant");
+    log("info", `[${channel.name}] [diag] messages count=${messages.length}, lastAssistant=${lastAssistant ? `id=${lastAssistant.info?.id} parts=${JSON.stringify((lastAssistant.parts ?? []).map((p: any) => ({ type: p.type, textLen: p.text?.length ?? 0 })))}` : "null"}`);
     if (lastAssistant) {
       responseText = extractResponseText(lastAssistant.parts ?? []);
     }
@@ -300,6 +248,7 @@ async function consumeSessionEvents(
     log("error", `[${channel.name}] 获取最终回复失败: ${String(err)}`);
   }
 
+  log("info", `[${channel.name}] [diag] responseText length=${responseText?.length ?? 0} preview="${responseText?.slice(0, 80)}"`);
   if (!responseText) {
     responseText = "（AI 没有返回文字回复）";
   }
@@ -308,51 +257,7 @@ async function consumeSessionEvents(
   await channel.send(replyTarget, responseText);
 }
 
-/**
- * SSE 不可用时的降级方案：轮询等待 session 变为 idle 状态。
- * 每 1 秒查询一次，最多等待 5 分钟。
- */
-async function pollForSessionCompletion(
-  client: PluginClient,
-  channelName: string,
-  sessionId: string
-): Promise<void> {
-  const POLL_INTERVAL_MS = 1000;
-  const MAX_WAIT_MS = 5 * 60 * 1000; // 5 分钟
-  const started = Date.now();
 
-  while (Date.now() - started < MAX_WAIT_MS) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-    try {
-      const res = await client.session.status();
-      const allStatuses = res.data ?? {};
-      const sessionStatus = (allStatuses as Record<string, { type: string }>)[sessionId];
-      if (!sessionStatus || sessionStatus.type === "idle") break; // idle 或已删除
-    } catch {
-      // 查询失败时继续等待
-      void client.app.log({
-        body: { service: "chat-channel", level: "warn", message: `[${channelName}] 轮询 session 状态失败，继续等待...` },
-      });
-    }
-}
-}
-
-/**
- * 判断一个 SSE 事件是否属于指定 session。
- * message.part.updated / session.idle / session.error 都带 sessionID。
- */
-function isSessionEvent(event: any, sessionId: string): boolean {
-  if (!event || !event.type) return false;
-  const props = event.properties;
-  if (!props) return false;
-
-  // message.part.updated: properties.part.sessionID
-  if (event.type === "message.part.updated") {
-    return props.part?.sessionID === sessionId;
-  }
-  // session.idle / session.error: properties.sessionID
-  return props.sessionID === sessionId || props.id === sessionId;
-}
 
 // ─── 插件主体 ─────────────────────────────────────────────────────────────────
 
@@ -404,6 +309,10 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
     return {};
   }
 
+  // 跨渠道共享的 pendingMap：sessionId → { resolve, reject }
+  // event 钩子（进程内回调）通过此 Map 唤醒等待中的消息处理协程
+  const pendingMap: PendingMap = new Map();
+
   // 为每个渠道启动独立的消息监听和 session 管理
   const cleanupTimers: ReturnType<typeof setInterval>[] = [];
 
@@ -417,7 +326,7 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
     const timer = sessionManager.startAutoCleanup();
     cleanupTimers.push(timer);
 
-    const handleMessage = createMessageHandler(channel, sessionManager, client);
+    const handleMessage = createMessageHandler(channel, sessionManager, client, pendingMap);
     await channel.start(handleMessage);
   }
 
@@ -433,15 +342,31 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
 
   return {
     event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
+      const props = event.properties as Record<string, unknown> | undefined;
+
+      if (event.type === "session.idle") {
+        const sessionId = (props?.["sessionID"] ?? props?.["id"]) as string | undefined;
+        if (sessionId) {
+          fileLog("info", `[diag] event hook: session.idle sessionId=${sessionId}`);
+          pendingMap.get(sessionId)?.resolve();
+        }
+      }
+
       if (event.type === "session.error") {
+        const sessionId = (props?.["sessionID"] ?? props?.["id"]) as string | undefined;
+        const errMsg = (props?.["message"] ?? "unknown error") as string;
         await client.app.log({
           body: {
             service: "chat-channel",
             level: "warn",
             message: "opencode session 出现错误",
-            extra: event.properties as Record<string, unknown>,
+            extra: props as Record<string, unknown>,
           },
         });
+        if (sessionId) {
+          fileLog("info", `[diag] event hook: session.error sessionId=${sessionId} err=${errMsg}`);
+          pendingMap.get(sessionId)?.reject(new Error(errMsg));
+        }
       }
     },
   };

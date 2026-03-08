@@ -5,8 +5,27 @@
  * 与具体渠道无关，所有 channel 实现共享同一套逻辑。
  */
 
-import { readFileSync } from "fs";
+import { readFileSync, appendFileSync, mkdirSync } from "fs";
 import type { PluginClient } from "./types.js";
+
+// ─── 文件日志 ────────────────────────────────────────────────────────────────
+
+const LOG_DIR = `${process.env["HOME"] ?? "/tmp"}/.local/share/opencode/log`;
+const LOG_FILE = `${LOG_DIR}/chat-channel.log`;
+
+/**
+ * 写日志到文件（同步追加），同时调用 client.app.log()。
+ * 用于替代纯依赖 client.app.log() 的场景，确保日志落盘可查。
+ */
+export function fileLog(level: "info" | "warn" | "error", message: string): void {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    const ts = new Date().toISOString();
+    appendFileSync(LOG_FILE, `${ts} [${level.toUpperCase()}] ${message}\n`, "utf8");
+  } catch {
+    // 写文件失败时静默忽略，不影响主流程
+  }
+}
 
 // ─── 类型 ─────────────────────────────────────────────────────────────────────
 
