@@ -224,20 +224,19 @@ class FeishuChannel implements ChatChannel {
 
 /**
  * 构建「思考中」飞书卡片结构。
+ * 使用旧版卡片格式（elements 在顶层），兼容性更好，无需 schema 字段。
  * update_multi:true 是 patch 更新的必要条件。
  * 使用 markdown element 展示文本，支持换行和 emoji。
  */
 function buildThinkingCard(text: string): object {
   return {
     config: { update_multi: true },
-    body: {
-      elements: [
-        {
-          tag: "markdown",
-          content: text,
-        },
-      ],
-    },
+    elements: [
+      {
+        tag: "markdown",
+        content: text,
+      },
+    ],
   };
 }
 
