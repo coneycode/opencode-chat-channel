@@ -226,32 +226,61 @@ async function consumeSessionEvents(
   }
 
   if (eventStream) {
+    // 先检查 session 是否已经 idle（SSE 是 lazy generator，HTTP 连接
+    // 在 for-await 时才建立，可能错过已经发布的 session.idle 事件）
+    let alreadyDone = false;
     try {
-      for await (const event of eventStream.stream) {
-        // 只处理当前 session 的事件
-        if (!isSessionEvent(event, sessionId)) continue;
+      const statusRes = await client.session.status();
+      const allStatuses = statusRes.data ?? {};
+      const sessionStatus = (allStatuses as Record<string, { type: string }>)[sessionId];
+      if (!sessionStatus || sessionStatus.type === "idle") {
+        alreadyDone = true;
+        log("info", `[${channel.name}] session 已完成，跳过 SSE 等待`);
+      }
+    } catch {
+      // 查询失败时继续走 SSE 路径
+    }
 
-        if (event.type === "message.part.updated") {
-          const part = event.properties?.part;
-          if (!part) continue;
+    if (!alreadyDone) {
+      // SSE 等待，加超时保障（最多 3 分钟）
+      const SSE_TIMEOUT_MS = 3 * 60 * 1000;
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => {
+        log("warn", `[${channel.name}] SSE 等待超时，强制结束`);
+        abortController.abort();
+      }, SSE_TIMEOUT_MS);
 
-          if (part.type === "reasoning" && part.text) {
-            reasoningAccum = part.text;
-            const preview = stripMarkdownTables(reasoningAccum.slice(0, REASONING_PREVIEW_LEN));
-            const suffix = reasoningAccum.length > REASONING_PREVIEW_LEN ? "..." : "";
-            await throttledPatch(`💭 **正在思考...**\n\n${preview}${suffix}`);
-          } else if (part.type === "tool" && part.state?.status === "running") {
-            const toolLabel = (part.tool ?? "") || "工具";
-            await throttledPatch(`🔧 **正在使用工具：${toolLabel}**`);
+      try {
+        for await (const event of eventStream.stream) {
+          if (abortController.signal.aborted) break;
+          if (!isSessionEvent(event, sessionId)) continue;
+
+          if (event.type === "message.part.updated") {
+            const part = event.properties?.part;
+            if (!part) continue;
+
+            if (part.type === "reasoning" && part.text) {
+              reasoningAccum = part.text;
+              const preview = stripMarkdownTables(reasoningAccum.slice(0, REASONING_PREVIEW_LEN));
+              const suffix = reasoningAccum.length > REASONING_PREVIEW_LEN ? "..." : "";
+              await throttledPatch(`💭 **正在思考...**\n\n${preview}${suffix}`);
+            } else if (part.type === "tool" && part.state?.status === "running") {
+              const toolLabel = (part.tool ?? "") || "工具";
+              await throttledPatch(`🔧 **正在使用工具：${toolLabel}**`);
+            }
+          }
+
+          if (event.type === "session.idle" || event.type === "session.error") {
+            break;
           }
         }
-
-        if (event.type === "session.idle" || event.type === "session.error") {
-          break;
+      } catch (err) {
+        if (!abortController.signal.aborted) {
+          log("warn", `[${channel.name}] SSE 事件流中断: ${String(err)}`);
         }
+      } finally {
+        clearTimeout(timeoutId);
       }
-    } catch (err) {
-      log("warn", `[${channel.name}] SSE 事件流中断: ${String(err)}`);
     }
   } else {
     // SSE 不可用时，轮询等待 session 完成
