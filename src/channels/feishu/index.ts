@@ -16,6 +16,7 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { execFileSync } from "child_process";
 import type { ChatChannel, ChannelFactory, IncomingMessage, PluginClient } from "../../types.js";
+import { fileLog } from "../../session-manager.js";
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -131,10 +132,11 @@ class FeishuChannel implements ChatChannel {
 
   /**
    * 发送「正在思考」卡片占位消息，返回 message_id 用于后续 patch 更新。
-   * 使用 interactive 卡片 + update_multi:true，才支持 patch 更新内容。
+   * 使用新版卡片格式（schema 2.0）+ collapsible_panel，支持 patch 更新内容。
+   * update_multi:true 是 patch 更新的必要条件。
    */
   async sendThinkingCard(chatId: string): Promise<string | null> {
-    const card = buildThinkingCard("⏳ 正在思考...");
+    const card = buildCard("⏳ 正在思考...", "", "thinking");
     try {
       const res = await this.larkClient.im.message.create({
         params: { receive_id_type: "chat_id" },
@@ -144,34 +146,84 @@ class FeishuChannel implements ChatChannel {
           msg_type: "interactive",
         },
       });
-      return res.data?.message_id ?? null;
+      const msgId = res.data?.message_id ?? null;
+      fileLog("info", `[feishu] sendThinkingCard 成功: msgId=${msgId}`);
+      return msgId;
     } catch (err) {
-      // 卡片发送失败不阻断主流程，降级为无思考提示
+      const errStr = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : String(err);
       void this.client.app.log({
         body: {
           service: "chat-channel",
           level: "warn",
-          message: `[feishu] 发送思考卡片失败: ${String(err)}`,
+          message: `[feishu] sendThinkingCard 失败: ${errStr}`,
         },
       });
+      // 同步写文件日志，确保错误可见
+      fileLog("warn", `[feishu] sendThinkingCard 失败: ${errStr}`);
       return null;
     }
   }
 
   /**
-   * 更新已发送的思考卡片内容。
+   * 更新已发送的思考卡片内容（旧接口，向下兼容）。
    * @param messageId  sendThinkingCard 返回的 message_id
    * @param statusText 要显示的新状态文本
    */
   async updateThinkingCard(messageId: string, statusText: string): Promise<void> {
-    const card = buildThinkingCard(statusText);
+    const card = buildCard(statusText, "", "thinking");
     try {
       await this.larkClient.im.message.patch({
         data: { content: JSON.stringify(card) },
         path: { message_id: messageId },
       });
-    } catch {
-      // patch 失败静默忽略，不影响最终回复发送
+      fileLog("info", `[feishu] updateThinkingCard 成功: msgId=${messageId}`);
+    } catch (err) {
+      const errStr = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : String(err);
+      void this.client.app.log({ body: { service: "chat-channel", level: "warn", message: `[feishu] updateThinkingCard patch 失败: ${errStr}` } });
+      fileLog("warn", `[feishu] updateThinkingCard patch 失败: ${errStr}`);
+    }
+  }
+
+  /**
+   * 更新思考卡片为进度状态（reasoning / replying 阶段）。
+   * 外部摘要可见，详情需点击展开。
+   */
+  async patchProgress(
+    messageId: string,
+    summary: string,
+    detail: string,
+    stage: "reasoning" | "replying"
+  ): Promise<void> {
+    const card = buildCard(summary, detail, stage);
+    try {
+      await this.larkClient.im.message.patch({
+        data: { content: JSON.stringify(card) },
+        path: { message_id: messageId },
+      });
+      fileLog("info", `[feishu] patchProgress 成功: msgId=${messageId} stage=${stage}`);
+    } catch (err) {
+      const errStr = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : String(err);
+      void this.client.app.log({ body: { service: "chat-channel", level: "warn", message: `[feishu] patchProgress 失败: ${errStr}` } });
+      fileLog("warn", `[feishu] patchProgress 失败: ${errStr}`);
+    }
+  }
+
+  /**
+   * 更新思考卡片为完成状态。
+   * 卡片摘要变为"✅ 已完成"，detail 内容可展开查看。
+   */
+  async patchDone(messageId: string, detail: string): Promise<void> {
+    const card = buildCard("✅ 已完成", detail, "done");
+    try {
+      await this.larkClient.im.message.patch({
+        data: { content: JSON.stringify(card) },
+        path: { message_id: messageId },
+      });
+      fileLog("info", `[feishu] patchDone 成功: msgId=${messageId}`);
+    } catch (err) {
+      const errStr = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : String(err);
+      void this.client.app.log({ body: { service: "chat-channel", level: "warn", message: `[feishu] patchDone 失败: ${errStr}` } });
+      fileLog("warn", `[feishu] patchDone 失败: ${errStr}`);
     }
   }
 
@@ -223,21 +275,34 @@ class FeishuChannel implements ChatChannel {
 // ─── 卡片构建工具 ─────────────────────────────────────────────────────────────
 
 /**
- * 构建「思考中」飞书卡片结构。
- * 使用旧版卡片格式（elements 在顶层），兼容性更好，无需 schema 字段。
+ * 构建飞书新版卡片（schema 2.0），使用 header + body 结构。
+ * header 标题始终可见（摘要），body markdown 展示详情（实时 patch 更新）。
  * update_multi:true 是 patch 更新的必要条件。
- * 使用 markdown element 展示文本，支持换行和 emoji。
  */
-function buildThinkingCard(text: string): object {
-  return {
-    config: { update_multi: true },
-    elements: [
-      {
-        tag: "markdown",
-        content: text,
-      },
-    ],
+function buildCard(
+  summary: string,
+  detail: string,
+  stage: "thinking" | "reasoning" | "replying" | "done"
+): object {
+  const templates: Record<typeof stage, string> = {
+    thinking: "blue",
+    reasoning: "wathet",
+    replying: "turquoise",
+    done: "green",
   };
+  const card: Record<string, unknown> = {
+    schema: "2.0",
+    config: { update_multi: true },
+    header: {
+      title: { tag: "plain_text", content: summary },
+      template: templates[stage],
+    },
+  };
+  // 飞书 schema 2.0 要求 body 必须存在，detail 为空时用空占位
+  card["body"] = {
+    elements: detail ? [{ tag: "markdown", content: detail }] : [{ tag: "markdown", content: " " }],
+  };
+  return card;
 }
 
 // ─── 工厂函数 ─────────────────────────────────────────────────────────────────
