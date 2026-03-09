@@ -22,8 +22,8 @@ export function fileLog(level: "info" | "warn" | "error", message: string): void
     mkdirSync(LOG_DIR, { recursive: true });
     const ts = new Date().toISOString();
     appendFileSync(LOG_FILE, `${ts} [${level.toUpperCase()}] ${message}\n`, "utf8");
-  } catch {
-    // 写文件失败时静默忽略，不影响主流程
+  } catch (err) {
+    process.stderr.write(`[chat-channel] fileLog 写入失败: ${String(err)}\n`);
   }
 }
 
