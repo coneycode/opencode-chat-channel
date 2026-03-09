@@ -96,20 +96,98 @@ function stripMarkdownTables(text: string): string {
     .trim();
 }
 
-/** reasoning 摘要最大字符数 */
-const REASONING_PREVIEW_LEN = 200;
-
-/** patch 节流间隔（ms）：避免高频 reasoning 刷屏 */
-const PATCH_THROTTLE_MS = 3000;
-
 /**
  * 待处理的 session 完成等待 Map。
- * key = sessionId，value = { resolve, reject } 用于在 event 钩子触发时唤醒等待方。
+ * key = sessionId，value = PendingEntry 包含 resolve/reject 及实时 patch 所需状态。
  * 由 ChatChannelPlugin 创建后注入到 createMessageHandler 中使用。
  */
-type PendingEntry = { resolve: () => void; reject: (err: Error) => void };
+type PendingEntry = {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  /** sendThinkingCard 返回的 message_id，用于 patch 更新 */
+  thinkingMsgId: string | null;
+  /** 对应的渠道实例，用于调用 patchProgress / patchDone */
+  channel: ChatChannel;
+  /** 回复目标（chat_id），用于发送最终回复 */
+  replyTarget: string;
+  /** 最后一次执行 patch 的时间戳（ms），用于节流 */
+  lastPatchTime: number;
+  /** 节流延迟 patch 的 timer，存在则说明有待执行的 patch */
+  pendingPatchTimer: ReturnType<typeof setTimeout> | null;
+  /** 当前累积的 reasoning 全文（opencode 每次发全量，直接覆盖） */
+  reasoning: string;
+  /**
+   * 按 part id 追踪的 text 片段（有序，支持多 step 累积）。
+   * opencode 对同一 part 发全量更新（非 delta），直接按 id 覆盖对应槽位。
+   * 不同 step 产生的 text 拥有不同 part id，因此可以并排保留。
+   */
+  textParts: Map<string, string>;
+  /** text part id 的有序数组，保证拼接顺序与 AI 输出顺序一致 */
+  textPartOrder: string[];
+  /**
+   * 按 callID 追踪的工具调用状态（pending / running / completed）。
+   * 同一 callID 的 part 会多次更新，直接覆盖。
+   */
+  toolParts: Map<string, { tool: string; status: string; input?: unknown; output?: string }>;
+  /** tool callID 的有序数组，保证展示顺序与 AI 调用顺序一致 */
+  toolPartOrder: string[];
+};
 type PendingMap = Map<string, PendingEntry>;
 
+/** patch 节流间隔（ms）：避免高频 reasoning 触发飞书限频（5 QPS） */
+const PATCH_THROTTLE_MS = 2000;
+
+/** 从 entry 状态构建折叠面板内部的 detail 文本（Markdown） */
+function buildDetailContent(entry: PendingEntry): string {
+  const parts: string[] = [];
+  if (entry.reasoning) {
+    parts.push(`**💭 推理过程**\n${entry.reasoning}`);
+  }
+  // 工具调用行（简洁格式：图标 + 名称 + 状态）
+  for (const callId of entry.toolPartOrder) {
+    const t = entry.toolParts.get(callId);
+    if (!t) continue;
+    const statusIcon = t.status === "completed" ? "✓" : t.status === "running" ? "..." : "⏳";
+    const inputStr = t.input !== undefined ? `\n  input: \`${JSON.stringify(t.input)}\`` : "";
+    const outputStr = t.output ? `\n  output: ${t.output.length > 200 ? t.output.slice(0, 200) + "..." : t.output}` : "";
+    parts.push(`🔧 **${t.tool}** (${statusIcon})${inputStr}${outputStr}`);
+  }
+  // 文本内容（多 step 累积，追加不覆盖）
+  const allText = entry.textPartOrder
+    .map((id) => entry.textParts.get(id) ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+  if (allText) {
+    parts.push(`**✍️ 回复内容**\n${allText}`);
+  }
+  return parts.join("\n\n---\n\n") || "（暂无内容）";
+}
+
+/** 执行一次 patch，更新卡片内容，并重置节流计时 */
+function doPatch(entry: PendingEntry): void {
+  if (!entry.thinkingMsgId) return;
+  entry.lastPatchTime = Date.now();
+  const hasText = entry.textPartOrder.some((id) => (entry.textParts.get(id) ?? "").length > 0);
+  const stage = hasText ? "replying" : "reasoning";
+  const summaryText = hasText ? "✍️ 正在输出回复..." : "🤔 正在推理...";
+  const detail = buildDetailContent(entry);
+  // 异步 patch，失败静默忽略（channel.patchProgress 内部已处理）
+  void entry.channel.patchProgress?.(entry.thinkingMsgId, summaryText, detail, stage);
+}
+
+/** 节流调度：距上次 patch 超过阈值则立即执行，否则等到下个窗口 */
+function scheduleThrottledPatch(entry: PendingEntry): void {
+  const now = Date.now();
+  if (now - entry.lastPatchTime >= PATCH_THROTTLE_MS) {
+    doPatch(entry);
+  } else if (!entry.pendingPatchTimer) {
+    const delay = PATCH_THROTTLE_MS - (now - entry.lastPatchTime);
+    entry.pendingPatchTimer = setTimeout(() => {
+      entry.pendingPatchTimer = null;
+      doPatch(entry);
+    }, delay);
+  }
+}
 
 /**
  * 为指定渠道创建消息处理函数。
@@ -119,7 +197,8 @@ type PendingMap = Map<string, PendingEntry>;
  *   1. 发送"正在思考"占位卡片（支持 patch 的渠道）
  *   2. promptAsync 发起 AI 请求（立即返回）
  *   3. 等待 event 钩子回调（session.idle / session.error），由 pendingMap 协调
- *   4. session 完成后读取最终回复并发送
+ *      - 期间 message.part.updated 事件触发节流 patch，实时更新卡片内容
+ *   4. session 完成后 patch 卡片为完成态，读取最终回复并发送
  */
 function createMessageHandler(
   channel: ChatChannel,
@@ -145,6 +224,7 @@ function createMessageHandler(
     let thinkingMsgId: string | null = null;
     if (channel.sendThinkingCard) {
       thinkingMsgId = await channel.sendThinkingCard(replyTarget);
+      fileLog("info", `[${channel.name}] sendThinkingCard 完成: thinkingMsgId=${thinkingMsgId}`);
     }
 
     let sessionId: string;
@@ -169,8 +249,10 @@ function createMessageHandler(
           parts: [{ type: "text", text }],
         },
       });
+      fileLog("info", `[${channel.name}] promptAsync 成功: sessionId=${sessionId}`);
     } catch (err: unknown) {
       const errorMsg = (err as any)?.data?.message ?? (err as any)?.message ?? String(err);
+      fileLog("error", `[${channel.name}] promptAsync 失败: ${errorMsg}`);
       await client.app.log({
         body: { service: "chat-channel", level: "error", message: `[${channel.name}] promptAsync 失败: ${errorMsg}`, extra: { userId } },
       });
@@ -229,32 +311,24 @@ async function waitForSessionAndReply(
         pendingMap.delete(sessionId);
         reject(err);
       },
+      thinkingMsgId,
+      channel,
+      replyTarget,
+      lastPatchTime: 0,
+      pendingPatchTimer: null,
+      reasoning: "",
+      textParts: new Map(),
+      textPartOrder: [],
+      toolParts: new Map(),
+      toolPartOrder: [],
     });
   }).catch((err: Error) => {
     log("error", `[${channel.name}] session 出错: ${err.message}`);
   });
 
-  // 获取最终回复并发送
-  let responseText: string | null = null;
-  try {
-    const messagesRes = await client.session.messages({ path: { id: sessionId } });
-    const messages = messagesRes.data ?? [];
-    const lastAssistant = [...messages].reverse().find((m: any) => m.info?.role === "assistant");
-    log("info", `[${channel.name}] [diag] messages count=${messages.length}, lastAssistant=${lastAssistant ? `id=${lastAssistant.info?.id} parts=${JSON.stringify((lastAssistant.parts ?? []).map((p: any) => ({ type: p.type, textLen: p.text?.length ?? 0 })))}` : "null"}`);
-    if (lastAssistant) {
-      responseText = extractResponseText(lastAssistant.parts ?? []);
-    }
-  } catch (err) {
-    log("error", `[${channel.name}] 获取最终回复失败: ${String(err)}`);
-  }
-
-  log("info", `[${channel.name}] [diag] responseText length=${responseText?.length ?? 0} preview="${responseText?.slice(0, 80)}"`);
-  if (!responseText) {
-    responseText = "（AI 没有返回文字回复）";
-  }
-
-  // 发送最终文字回复（始终发新消息，占位卡片保持最后的思考状态）
-  await channel.send(replyTarget, responseText);
+  // 卡片已在 event 钩子（session.idle）中 patchDone 更新为完成态，
+  // 不再额外发送文本回复，避免内容重复。
+  log("info", `[${channel.name}] session 完成，卡片已更新，跳过文本回复`);
 }
 
 
@@ -309,7 +383,7 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
     return {};
   }
 
-  // 跨渠道共享的 pendingMap：sessionId → { resolve, reject }
+  // 跨渠道共享的 pendingMap：sessionId → PendingEntry
   // event 钩子（进程内回调）通过此 Map 唤醒等待中的消息处理协程
   const pendingMap: PendingMap = new Map();
 
@@ -344,11 +418,68 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
     event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
       const props = event.properties as Record<string, unknown> | undefined;
 
+      // ── message.part.updated：AI 正在输出，触发节流 patch ──────────────────
+      if (event.type === "message.part.updated") {
+        const part = props?.["part"] as Record<string, unknown> | undefined;
+        // 诊断日志：记录 part 实际结构，供调试字段名使用
+        fileLog("info", `[diag] part.updated raw: ${JSON.stringify(part).slice(0, 300)}`);
+        const sessionId = (part?.["sessionID"] ?? part?.["session_id"]) as string | undefined;
+        if (sessionId) {
+          const entry = pendingMap.get(sessionId);
+          if (entry) {
+            const partType = part?.["type"] as string | undefined;
+            const partId = part?.["id"] as string | undefined;
+            if (partType === "reasoning") {
+              entry.reasoning = (part?.["text"] ?? "") as string;
+              scheduleThrottledPatch(entry);
+            } else if (partType === "text") {
+              if (partId) {
+                if (!entry.textParts.has(partId)) {
+                  entry.textPartOrder.push(partId);
+                }
+                entry.textParts.set(partId, (part?.["text"] ?? "") as string);
+              }
+              scheduleThrottledPatch(entry);
+            } else if (partType === "tool") {
+              const callId = part?.["callID"] as string | undefined;
+              const toolName = part?.["tool"] as string | undefined;
+              const toolState = part?.["state"] as Record<string, unknown> | undefined;
+              const status = toolState?.["status"] as string | undefined;
+              const toolInput = toolState?.["input"];
+              const toolOutput = toolState?.["output"] as string | undefined;
+              if (callId && toolName && status) {
+                if (!entry.toolParts.has(callId)) {
+                  entry.toolPartOrder.push(callId);
+                }
+                entry.toolParts.set(callId, { tool: toolName, status, input: toolInput, output: toolOutput });
+                // tool 更新也触发节流 patch，让工具进展可见
+                scheduleThrottledPatch(entry);
+              }
+              // step-start / step-finish: 无需处理
+            }
+          }
+        }
+      }
+
       if (event.type === "session.idle") {
         const sessionId = (props?.["sessionID"] ?? props?.["id"]) as string | undefined;
         if (sessionId) {
           fileLog("info", `[diag] event hook: session.idle sessionId=${sessionId}`);
-          pendingMap.get(sessionId)?.resolve();
+          const entry = pendingMap.get(sessionId);
+          if (entry) {
+            // 取消尚未执行的节流 patch
+            if (entry.pendingPatchTimer) {
+              clearTimeout(entry.pendingPatchTimer);
+              entry.pendingPatchTimer = null;
+            }
+            // patch 卡片为完成态
+            fileLog("info", `[diag] session.idle: thinkingMsgId=${entry.thinkingMsgId}, hasPatchDone=${!!entry.channel.patchDone}, reasoning.len=${entry.reasoning.length}, textParts.count=${entry.textPartOrder.length}, toolParts.count=${entry.toolPartOrder.length}`);
+            if (entry.thinkingMsgId && entry.channel.patchDone) {
+              const detail = buildDetailContent(entry);
+              await entry.channel.patchDone(entry.thinkingMsgId, detail);
+            }
+            entry.resolve();
+          }
         }
       }
 
@@ -365,7 +496,15 @@ export const ChatChannelPlugin: Plugin = async ({ client }) => {
         });
         if (sessionId) {
           fileLog("info", `[diag] event hook: session.error sessionId=${sessionId} err=${errMsg}`);
-          pendingMap.get(sessionId)?.reject(new Error(errMsg));
+          const entry = pendingMap.get(sessionId);
+          if (entry) {
+            // 取消尚未执行的节流 patch
+            if (entry.pendingPatchTimer) {
+              clearTimeout(entry.pendingPatchTimer);
+              entry.pendingPatchTimer = null;
+            }
+            entry.reject(new Error(errMsg));
+          }
         }
       }
     },
