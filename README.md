@@ -35,7 +35,12 @@ Since this is an **opencode plugin**, opencode handles installation automaticall
 
 #### Step 1: Add to `opencode.json`
 
-Edit `~/.config/opencode/opencode.json` and add the plugin:
+Edit the opencode config file and add the plugin:
+
+| Platform | Path |
+|----------|------|
+| macOS / Linux | `~/.config/opencode/opencode.json` |
+| Windows | `%APPDATA%\opencode\opencode.json` |
 
 ```json
 {
@@ -49,7 +54,12 @@ opencode will pull and install the package automatically on next startup.
 
 #### Step 2: Select channels to enable
 
-Add `CHAT_CHANNELS` to `~/.config/opencode/.env` to control which channels are active:
+Add `CHAT_CHANNELS` to your opencode `.env` file to control which channels are active:
+
+| Platform | Path |
+|----------|------|
+| macOS / Linux | `~/.config/opencode/.env` |
+| Windows | `%APPDATA%\opencode\.env` |
 
 ```bash
 # ~/.config/opencode/.env
@@ -92,7 +102,8 @@ See the [Feishu Configuration](#feishu-configuration) section below.
 **App ID** (non-sensitive, store in `.env`):
 
 ```bash
-# ~/.config/opencode/.env
+# macOS / Linux: ~/.config/opencode/.env
+# Windows:       %APPDATA%\opencode\.env
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 
 # Optional: custom opencode API URL (default: http://localhost:4321)
@@ -101,17 +112,19 @@ FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 
 **App Secret** — choose the method for your platform:
 
-| Platform | Method | Command |
-|----------|--------|---------|
+| Platform | Method | Command / Location |
+|----------|--------|--------------------|
 | macOS | Keychain (recommended) | `security add-generic-password -a chat-channel -s opencode-chat-channel -w <secret> -U` |
-| Windows / Linux | `.env` file | Add `FEISHU_APP_SECRET=<secret>` to `~/.config/opencode/.env` |
+| Windows | `.env` file | Add `FEISHU_APP_SECRET=<secret>` to `%APPDATA%\opencode\.env` |
+| Linux | `.env` file | Add `FEISHU_APP_SECRET=<secret>` to `~/.config/opencode/.env` |
 | All platforms | Environment variable | Set `FEISHU_APP_SECRET=<secret>` before launching opencode |
 
 > **Priority**: environment variable → macOS Keychain → `.env` file value (already loaded as env var).
 > The plugin tries each in order and uses the first one found.
 
 > ⚠️ If you store the secret in `.env`, ensure the file has restricted permissions:
-> `chmod 600 ~/.config/opencode/.env`
+> - macOS/Linux: `chmod 600 ~/.config/opencode/.env`
+> - Windows: right-click the file → Properties → Security → restrict to your user only
 
 **macOS Keychain** (verify):
 
@@ -212,7 +225,12 @@ opencode AI (Sisyphus)
 
 #### 第一步：添加到 `opencode.json`
 
-编辑 `~/.config/opencode/opencode.json`，在 `plugin` 数组中添加：
+编辑 opencode 配置文件，在 `plugin` 数组中添加：
+
+| 平台 | 路径 |
+|------|------|
+| macOS / Linux | `~/.config/opencode/opencode.json` |
+| Windows | `%APPDATA%\opencode\opencode.json` |
 
 ```json
 {
@@ -226,7 +244,12 @@ opencode AI (Sisyphus)
 
 #### 第二步：选择要启用的渠道
 
-在 `~/.config/opencode/.env` 中配置 `CHAT_CHANNELS`，指定要开启哪些渠道：
+在 opencode 的 `.env` 文件中配置 `CHAT_CHANNELS`，指定要开启哪些渠道：
+
+| 平台 | 路径 |
+|------|------|
+| macOS / Linux | `~/.config/opencode/.env` |
+| Windows | `%APPDATA%\opencode\.env` |
 
 ```bash
 # ~/.config/opencode/.env
@@ -269,7 +292,8 @@ CHAT_CHANNELS=feishu
 **App ID**（非敏感，明文存 `.env`）：
 
 ```bash
-# ~/.config/opencode/.env
+# macOS / Linux: ~/.config/opencode/.env
+# Windows:       %APPDATA%\opencode\.env
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 
 # 可选：自定义 opencode API 地址（默认：http://localhost:4321）
@@ -278,19 +302,21 @@ FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 
 **App Secret**—按使用的平台选择存储方式：
 
-| 平台 | 方式 | 命令 |
-|------|------|------|
-| macOS | 钒匙串（推荐，不落盘明文） | `security add-generic-password -a chat-channel -s opencode-chat-channel -w <secret> -U` |
-| Windows / Linux | 写入 `.env` 文件 | 在 `~/.config/opencode/.env` 中添加 `FEISHU_APP_SECRET=<secret>` |
+| 平台 | 方式 | 命令 / 路径 |
+|------|------|-------------|
+| macOS | 钥匙串（推荐，不落盘明文） | `security add-generic-password -a chat-channel -s opencode-chat-channel -w <secret> -U` |
+| Windows | 写入 `.env` 文件 | 在 `%APPDATA%\opencode\.env` 中添加 `FEISHU_APP_SECRET=<secret>` |
+| Linux | 写入 `.env` 文件 | 在 `~/.config/opencode/.env` 中添加 `FEISHU_APP_SECRET=<secret>` |
 | 所有平台 | 环境变量 | 启动 opencode 前设置 `FEISHU_APP_SECRET=<secret>` |
 
-> **读取优先级**：环境变量 → macOS 钒匙串 → `.env` 文件（已在插件启动时自动读入环境变量）。
+> **读取优先级**：环境变量 → macOS 钥匙串 → `.env` 文件（已在插件启动时自动读入环境变量）。
 > 插件依次尝试，找到第一个有效值即停止。
 
 > ⚠️ 如果将 Secret 写入 `.env`，建议限制文件权限：
-> `chmod 600 ~/.config/opencode/.env`
+> - macOS/Linux：`chmod 600 ~/.config/opencode/.env`
+> - Windows：右键文件 → 属性 → 安全，限制为仅当前用户可读
 
-**macOS 钒匙串**验证：
+**macOS 钥匙串**验证：
 
 ```bash
 security find-generic-password -a chat-channel -s opencode-chat-channel -w
